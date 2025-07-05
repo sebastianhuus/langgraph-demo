@@ -8,6 +8,7 @@ from typing import Literal
 # load model from ollama
 llm = init_chat_model(
     "ollama:gemma3:4b",
+    n_ctx=8192,  # Set context length to 8192 tokens
 )
 
 # define strucutred message format 
