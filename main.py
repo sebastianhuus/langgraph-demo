@@ -31,3 +31,4 @@ messages = [{"role": "system", "content": "You are a helpful assistant called Ti
 state = graph.invoke({"messages": messages + [{"role": "user", "content": user_input}]})
 response = state["messages"][-1]
 print(response.content)
+print(state)
