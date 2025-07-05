@@ -1,150 +1,121 @@
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 from langchain.chat_models import init_chat_model
-from pydantic import BaseModel, Field
-from typing_extensions import TypedDict, Annotated
-from typing import Literal
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langchain_core.messages import HumanMessage
+import re
 
-# load model from ollama
-llm = init_chat_model(
+# init model from ollama
+model = init_chat_model(
     "ollama:gemma3:4b",
-    n_ctx=8192,  # Set context length to 8192 tokens
+    n_ctx=4096,
 )
 
-# define strucutred message format 
-class MessageClasifier(BaseModel):
-    message_type: Literal["emotional", "logical"] = Field(
-        ...,
-        description="Classify if the message requires an emotional (therapist) or logical response.",
-    )
+def get_weather(location: str):
+    """Returns weather info for a location."""
+    if location.lower() in ["sf", "san francisco"]:
+        return "It's 60 degrees and foggy."
+    return "It's 90 degrees and sunny."
 
-# set up graph
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
-    message_types: str | None
+# Available tools dictionary
+TOOLS = {
+    "get_weather": get_weather
+}
 
+def extract_tool_calls(text):
+    """Extract tool calls from model output using regex parsing."""
+    pattern = r"```tool_code\s*(.*?)\s*```"
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        code = match.group(1).strip()
+        try:
+            # Execute the tool call safely
+            result = eval(code, {"__builtins__": {}}, TOOLS)
+            return f'```tool_output\n{result}\n```'
+        except Exception as e:
+            return f'```tool_output\nError: {str(e)}\n```'
+    return None
 
-def classify_message(state: State):
-    last_message = state["messages"][-1]
-    classifier_llm = llm.with_structured_output(MessageClasifier)
+def create_tool_prompt(user_message):
+    """Create a prompt that instructs Gemma3 to use tools."""
+    tool_definitions = []
+    for name, func in TOOLS.items():
+        tool_definitions.append(f"def {name}({func.__code__.co_varnames[0]}: str) -> str:\n    \"\"\"{func.__doc__}\"\"\"")
+    
+    tools_str = "\n".join(tool_definitions)
+    
+    prompt = f"""You are a helpful assistant with access to the following Python functions:
 
-    result = classifier_llm.invoke(
-        [
-            {
-            "role": "system",
-            "content": """Classify the user message as either:
-            - 'emotional': if it asks for emotional support, therapy, deals with feelings, or personal problems
-            - 'logical': if it asks for facts, information, logical analysis, or practical solutions
-            """,
-            },
-            {
-                "role": "user",
-                "content": last_message.content,
-            },
-        ]
-    )
+```python
+{tools_str}
+```
 
-    print(f"Classifier result: {result.message_type}")
+When you need to use a function, wrap your function call in ```tool_code``` tags like this:
+```tool_code
+get_weather("San Francisco")
+```
 
-    return {"message_types": result.message_type}
+User: {user_message}"""
+    
+    return prompt
 
-def router(state: State) :
-    message_type = state.get("message_type", "logical") # Default to logical if not set
-    if message_type == "emotional":
-        return {"next": "therapist_agent"}
+def should_continue(state: MessagesState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    # Check if the last message contains tool code
+    if hasattr(last_message, 'content') and '```tool_code' in str(last_message.content):
+        return "tools"
+    return END
+
+def call_model(state: MessagesState):
+    messages = state["messages"]
+    # For the first message, create a tool-aware prompt
+    if len(messages) == 1:
+        user_message = messages[0].content
+        prompt = create_tool_prompt(user_message)
+        response = model.invoke([{"role": "user", "content": prompt}])
     else:
-        return {"next": "logical_agent"}
+        response = model.invoke(messages)
+    return {"messages": [response]}
 
-def therapist_agent(state: State) :
-    last_message = state["messages"][-1]
-    messages = [
-        {
-            "role": "system",
-            "content": "Do not use markdown formatting in your responses."
-        },
-        {
-            "role": "system",
-            "content": """You are a compassionate therapist. Focus on the emotional aspects of the user's message.
-                        Show empathy, validate their feelings, and help them process their emotions.
-                        Ask thoughtful questions to help them explore their feelings more deeply.
-                        Avoid giving logical solutions unless explicitly asked."""
-        },
-        {
-            "role": "user",
-            "content": last_message.content,
-        }
-    ]
+def execute_tools(state: MessagesState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # Extract and execute tool calls
+    tool_output = extract_tool_calls(last_message.content)
+    
+    if tool_output:
+        # Create a simple response with just the tool result
+        prompt = f"User asked: {messages[0].content}\n\nTool result: {tool_output}\n\nProvide a brief, direct answer using ONLY the tool result. Do not invent additional details."
+        response = model.invoke([{"role": "user", "content": prompt}])
+        return {"messages": [response]}
+    
+    return {"messages": []}
 
-    reply = llm.invoke(messages)
-    return {
-        "messages": [{"role": "assistant", "content": reply.content}],
-        "message_types": None
-    }
+# Build the LangGraph workflow
+builder = StateGraph(MessagesState)
+builder.add_node("call_model", call_model)
+builder.add_node("tools", execute_tools)
+builder.add_edge(START, "call_model")
+builder.add_conditional_edges("call_model", should_continue, ["tools", END])
+builder.add_edge("tools", "call_model")
+graph = builder.compile()
 
-def logical_agent(state: State) :
-    last_message = state["messages"][-1]
-    messages = [ 
-        {
-            "role": "system",
-            "content": "Do not use markdown formatting in your responses."
-        },
-        {
-            "role": "system",
-            "content": """You are a purely logical assistant. Focus only on facts and information.
-            Provide clear, concise answers based on logic and evidence.
-            Do not address emotions or provide emotional support.
-            Be direct and straightforward in your responses."""
-        },
-        {
-            "role": "user",
-            "content": last_message.content,
-        }
-    ]
+# Run the agent
+def print_conversation(result):
+    print("=== CONVERSATION FLOW ===")
+    messages = result["messages"]
+    
+    for i, message in enumerate(messages):
+        print(f"\n--- Message {i+1} ---")
+        print(f"Type: {type(message).__name__}")
+        print(f"Content: {message.content}")
+        
+        # Check if this message contains a tool call
+        if '```tool_code' in str(message.content):
+            print("🔧 TOOL CALL DETECTED")
+            tool_output = extract_tool_calls(message.content)
+            if tool_output:
+                print(f"Tool Result: {tool_output}")
 
-    reply = llm.invoke(messages)
-    return {
-        "messages": [{"role": "assistant", "content": reply.content}],
-        "message_types": None
-    }
-
-# define graph builder for the state
-graph_builder = StateGraph(State)
-graph_builder.add_node("classifier", classify_message)
-graph_builder.add_node("router", router)
-graph_builder.add_node("therapist_agent", therapist_agent)
-graph_builder.add_node("logical_agent", logical_agent)
-
-graph_builder.add_edge(START, "classifier")
-graph_builder.add_edge("classifier", "router")
-graph_builder.add_conditional_edges(
-    source="router",
-    path=lambda state: state.get("next"),
-    path_map={"therapist_agent": "therapist_agent", "logical_agent": "logical_agent"}
-)
-
-graph_builder.add_edge("therapist_agent", END)
-graph_builder.add_edge("logical_agent", END)
-
-graph = graph_builder.compile()
-
-def run_chatbot():
-    state = {"messages": [], "message_type": None}
-    while True:
-        user_input = input("Enter a message: ")
-
-        if user_input.lower() in ["exit", "quit"]:
-            print("Exiting the chatbot.")
-            break
-
-        state["messages"] = state.get("messages", []) + [{"role": "user", "content": user_input}]
-
-        state = graph.invoke(state)
-
-        if state.get("messages") and len(state["messages"]) > 0:
-            last_message = state["messages"][-1]
-            response = last_message.content
-            print(response)
-            #print(state)
-
-if __name__ == "__main__":
-    run_chatbot()
+result = graph.invoke({"messages": [HumanMessage(content="What's the weather in SF?")]})
+print_conversation(result)
