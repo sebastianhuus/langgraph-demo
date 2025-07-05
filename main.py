@@ -42,18 +42,28 @@ def create_tool_prompt(user_message):
     
     tools_str = "\n".join(tool_definitions)
     
-    prompt = f"""You are a helpful assistant with access to the following Python functions:
+    prompt = f"""You are a helpful assistant with access to predefined Python functions. Think step by step why and how these functions should be used.
 
+Available functions:
 ```python
 {tools_str}
 ```
 
-When you need to use a function, wrap your function call in ```tool_code``` tags like this:
+Instructions:
+- Only use the predefined functions listed above
+- When you need to call a function, wrap your function call in ```tool_code``` tags
+- Think about whether the user's request requires using a function
+- If a function is needed, generate the appropriate function call
+- Do not invent or hallucinate additional information
+
+Example:
 ```tool_code
 get_weather("San Francisco")
 ```
 
-User: {user_message}"""
+User: {user_message}
+
+Think step by step: Does this request require using one of the available functions? If yes, which function and with what parameters?"""
     
     return prompt
 
@@ -84,10 +94,14 @@ def execute_tools(state: MessagesState):
     tool_output = extract_tool_calls(last_message.content)
     
     if tool_output:
-        # Create a simple response with just the tool result
-        prompt = f"User asked: {messages[0].content}\n\nTool result: {tool_output}\n\nProvide a brief, direct answer using ONLY the tool result. Do not invent additional details."
-        response = model.invoke([{"role": "user", "content": prompt}])
-        return {"messages": [response]}
+        # Extract just the result from tool_output
+        result_match = re.search(r'```tool_output\n(.*?)\n```', tool_output, re.DOTALL)
+        if result_match:
+            clean_result = result_match.group(1).strip()
+            # Create a direct response with just the tool result
+            from langchain_core.messages import AIMessage
+            response = AIMessage(content=f"The weather information: {clean_result}")
+            return {"messages": [response]}
     
     return {"messages": []}
 
@@ -97,7 +111,7 @@ builder.add_node("call_model", call_model)
 builder.add_node("tools", execute_tools)
 builder.add_edge(START, "call_model")
 builder.add_conditional_edges("call_model", should_continue, ["tools", END])
-builder.add_edge("tools", "call_model")
+builder.add_edge("tools", END)
 graph = builder.compile()
 
 # Run the agent
@@ -118,4 +132,6 @@ def print_conversation(result):
                 print(f"Tool Result: {tool_output}")
 
 result = graph.invoke({"messages": [HumanMessage(content="What's the weather in SF?")]})
+print_conversation(result)
+result = graph.invoke({"messages": [HumanMessage(content="What's the weather in Oslo, Norway?")]})
 print_conversation(result)
