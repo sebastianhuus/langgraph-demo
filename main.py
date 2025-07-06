@@ -123,8 +123,45 @@ def think(state: MessagesState):
     if len(messages) == 1:
         user_message = messages[0].content
         logger.info(f"[THINK] First message - creating tool-aware prompt for: {user_message}")
-        prompt = create_tool_prompt(user_message)
-        response = model.invoke([{"role": "user", "content": prompt}])
+        
+        # Create system message with tool instructions
+        tool_definitions = []
+        for name, func in TOOLS.items():
+            tool_definitions.append(f"def {name}({func.__code__.co_varnames[0]}: str) -> str:\n    \"\"\"{func.__doc__}\"\"\"")
+        
+        system_prompt = f"""You are a helpful assistant with access to predefined Python functions. Think step by step why and how these functions should be used.
+
+Available functions:
+```python
+{chr(10).join(tool_definitions)}
+```
+
+CRITICAL INSTRUCTIONS:
+- Only use the exact function names shown above (no prefixes like 'weather_tool.' or 'tools.')
+- Call functions EXACTLY as shown in the examples below
+- When you need to call a function, wrap your function call in ```tool_code``` tags
+- Use the exact function names: get_weather
+
+CORRECT Examples:
+```tool_code
+get_weather("San Francisco")
+```
+
+```tool_code
+get_weather("New York")
+```
+
+INCORRECT Examples (DO NOT USE):
+- weather_tool.get_weather("San Francisco") ❌
+- tools.get_weather("San Francisco") ❌
+- weather.get_weather("San Francisco") ❌
+
+Think step by step: Does this request require using one of the available functions? If yes, use the EXACT function name from the list above."""
+        
+        response = model.invoke([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ])
     else:
         logger.info("[THINK] Continuing conversation with existing context")
         response = model.invoke(messages)
@@ -178,13 +215,13 @@ def respond(state: MessagesState):
     logger.info(f"[RESPOND] Generating final response from {len(messages)} messages")
     
     # Generate a clean response for the user based on the conversation
-    prompt = """Based on the conversation and any tool results, provide a clear, helpful response to the user. 
+    system_prompt = """Based on the conversation and any tool results, provide a clear, helpful response to the user. 
     Do not include any tool code or internal reasoning. Just give a direct, conversational answer.
     If there are tool results, incorporate them naturally into your response."""
     
-    # Add the prompt as a system message and get response
-    conversation_with_prompt = messages + [{"role": "user", "content": prompt}]
-    response = model.invoke(conversation_with_prompt)
+    # Add the system prompt and get response
+    conversation_with_system = [{"role": "system", "content": system_prompt}] + messages
+    response = model.invoke(conversation_with_system)
     
     logger.info(f"[RESPOND] Final response: {response.content}")
     return {"messages": [response]}
